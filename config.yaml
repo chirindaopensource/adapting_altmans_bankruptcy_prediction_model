@@ -1,0 +1,287 @@
+﻿# ========================================================================================
+# STUDY CONFIGURATION DICTIONARY: BANKRUPTCY PREDICTION VIA CoDa (plr) vs STANDARD RATIOS
+# ========================================================================================
+
+# -------------------------------------------------------------------------------------------------------------------------------
+# STUDY DOMAIN AND FILTERING CONSTRAINTS: Target Universe Definition
+# -------------------------------------------------------------------------------------------------------------------------------
+study_domain:
+  data_source: "SABI"  # Iberian Balance sheet Analysis System
+  geographic_focus: "Spain"  # implied by manuscript context; field may not exist in export  # UNSPECIFIED IN MANUSCRIPT
+  sector_nace_prefix: "46"  # operational filter for 46XX wholesale trade
+  sector_description: "Wholesale trade, except of motor vehicles and motorcycles"
+  min_employee_threshold: 5
+  accounts_last_year_min: 2023  # last available year must be >= 2023 (paper)
+  target_event_label: "concurso de acreedores"
+  extraction_date_iso: "2025-10-06"  # paper states 6/10/2025; interpreted as dd/mm/yyyy  # UNSPECIFIED FORMAT IN MANUSCRIPT
+  sabi_snapshot_id: null  # record SABI snapshot/version if available  # UNSPECIFIED IN MANUSCRIPT
+  accounts_type: null  # "Individual" or "Consolidated" must be fixed  # UNSPECIFIED IN MANUSCRIPT
+  currency: null  # e.g., "EUR"  # UNSPECIFIED IN MANUSCRIPT
+  unit_scale: null  # e.g., "EUR", "thousands_EUR"  # UNSPECIFIED IN MANUSCRIPT
+
+# -------------------------------------------------------------------------------------------------------------------------------
+# RAW DATA STRUCTURE SCHEMA: Unprocessed Input Features (one row per firm; includes both years t and t-1)
+# -------------------------------------------------------------------------------------------------------------------------------
+raw_data_schema:
+  indexing:
+    firm_id: "string"
+    label_year_field: "label_year"       # year t
+    feature_year_field: "feature_year"   # year t-1
+  metadata_fields:
+    nace_code: "string"
+    employees: "int"
+    status_t: "int"  # y_t: 1=bankrupt, 0=healthy
+    accounts_type: "string"  # optional but recommended  # UNSPECIFIED IN MANUSCRIPT
+    currency: "string"       # optional but recommended  # UNSPECIFIED IN MANUSCRIPT
+    unit_scale: "string"     # optional but recommended  # UNSPECIFIED IN MANUSCRIPT
+  accounting_parts:
+    # year t (audit only for inactivity rule)
+    t:
+      - "NCA_t"
+      - "CA_t"
+      - "RE_t"
+      - "NCL_t"
+      - "CL_t"
+      - "OR_t"
+      - "OE_t"
+    # year t-1 (actual predictor-year parts)
+    t-1:
+      - "NCA_t_minus_1"
+      - "CA_t_minus_1"
+      - "RE_t_minus_1"
+      - "NCL_t_minus_1"
+      - "CL_t_minus_1"
+      - "OR_t_minus_1"
+      - "OE_t_minus_1"
+
+# -------------------------------------------------------------------------------------------------------------------------------
+# TEMPORAL ALIGNMENT: Predict year t bankruptcy from year (t-1) predictors (anti-leakage contract)
+# -------------------------------------------------------------------------------------------------------------------------------
+temporal_alignment:
+  lag_years: 1
+  predictors_from: "t-1"
+  target_from: "t"
+  alignment_rule: "X_{t-1} -> y_t"  # described in prose  # UNSPECIFIED IN MANUSCRIPT AS FORMULA
+
+# -------------------------------------------------------------------------------------------------------------------------------
+# PRE-PROCESSING PARAMETERS: Inactivity exclusion + positivity enforcement for CoDa
+# -------------------------------------------------------------------------------------------------------------------------------
+pre_processing:
+  outlier_policy: "No pruning"  # explicit in manuscript
+
+  # Inactivity exclusion (the ONLY removal rule besides cohort filters)
+  inactivity_exclusion:
+    apply_if_exists_in_years:
+      - "t"
+      - "t-1"  # last year or year before last (paper)
+    rule: "(NCA + CA == 0) AND (OR == 0) AND (OE == 0)"  # conjunction, not disjunction
+    computed_fields:
+      total_assets: "NCA + CA"
+
+  # Missing values (NA) policy
+  missing_value_policy:
+    allowed: false  # recommended strictness; manuscript discusses zeros, not NA  # UNSPECIFIED IN MANUSCRIPT
+    action_if_present: "raise_error"  # avoid silent drift  # UNSPECIFIED IN MANUSCRIPT
+
+  # Negative values policy for CoDa parts (log-ratios require positivity)
+  negative_value_policy:
+    allowed_in_parts: false  # CoDa parts must be >0
+    action_if_present: "raise_error_and_reconcile_SABI_mapping"  # manuscript silent  # UNSPECIFIED IN MANUSCRIPT
+
+  # Zero replacement
+  zero_replacement:
+    method: "log-ratio EM"  # Palarea-Albaladejo & Martín-Fernández (2008)
+    software: "CoDaPack 2.0"
+    applies_to_year: "t-1"  # predictors year; manuscript implies this but does not spell it out  # UNSPECIFIED IN MANUSCRIPT
+    raw_zero_densities_reported:
+      NCA: 0.0138
+      CA: 0.0001
+      RE: 0.0554
+      NCL: 0.2258
+      CL: 0.0005
+    imputation_output_contract: "all 7 parts strictly positive in predictor year (t-1)"
+
+# -------------------------------------------------------------------------------------------------------------------------------
+# FEATURE ENGINEERING: Explicit equation-level definitions (prevents silent formula drift)
+# -------------------------------------------------------------------------------------------------------------------------------
+feature_engineering:
+  # Log definition
+  log_definition:
+    log_base: "natural_log"  # R log() is natural; manuscript writes log(.)  # UNSPECIFIED IN MANUSCRIPT
+
+  # Standard ratios (10 predictors) used for all three methods under the standard approach
+  standard_ratios:
+    count: 10
+    equations:
+      Eq1:
+        - "(CA-CL)/(NCA+CA)"
+        - "RE/(NCA+CA)"
+        - "(OR-OE)/(NCA+CA)"
+        - "(NCA+CA-NCL-CL)/(NCL+CL)"
+        - "OR/(NCA+CA)"
+      Eq2:
+        - "(OR-OE)/CL"
+        - "CA/CL"
+        - "(NCA+CA-NCL-CL)/(NCA+CA)"
+        - "(OR-OE)/(NCA+CA-NCL-CL)"
+        - "(NCL+CL)/(NCA+CA)"
+    accounting_aggregates:
+      total_assets: "NCA+CA"
+      total_liabilities: "NCL+CL"
+      net_worth_book: "NCA+CA-NCL-CL"
+      operating_profit: "OR-OE"  # not a CoDa part; used only here
+
+  # CoDa: non-redundant plr set (D-1 = 6) for logistic regression (Eq. 3)
+  coda_plr_non_redundant:
+    count: 6
+    graph_property: "connected_acyclic_spanning_tree_over_7_parts"
+    plr_list:
+      - "log(NCA/CA)"
+      - "log(OR/CA)"
+      - "log(OR/OE)"
+      - "log(CA/CL)"
+      - "log(NCL/CL)"
+      - "log(RE/NCL)"
+
+  # CoDa: exhaustive plr set (D(D-1)/2 = 21) for k-NN and random forest (Eq. 4)
+  coda_plr_exhaustive:
+    count: 21
+    plr_list:
+      - "log(NCA/CA)"
+      - "log(NCA/RE)"
+      - "log(NCA/NCL)"
+      - "log(NCA/CL)"
+      - "log(NCA/OR)"
+      - "log(NCA/OE)"
+      - "log(CA/RE)"
+      - "log(CA/NCL)"
+      - "log(CA/CL)"
+      - "log(OR/CA)"
+      - "log(CA/OE)"
+      - "log(RE/NCL)"
+      - "log(RE/CL)"
+      - "log(RE/OR)"
+      - "log(RE/OE)"
+      - "log(NCL/CL)"
+      - "log(NCL/OR)"
+      - "log(NCL/OE)"
+      - "log(CL/OR)"
+      - "log(CL/OE)"
+      - "log(OR/OE)"
+    distance_rationale: "Euclidean distance on all 21 plr is Aitchison-consistent (as stated in manuscript)"
+
+# -------------------------------------------------------------------------------------------------------------------------------
+# SAMPLING AND PARTITIONING PARAMETERS: Split + training downsampling
+# -------------------------------------------------------------------------------------------------------------------------------
+sampling:
+  train_fraction: 0.70
+  validation_fraction: 0.30
+
+  split_strategy: "random_split"  # manuscript says random; does not specify stratification  # UNSPECIFIED IN MANUSCRIPT
+  split_stratified_by_status: false  # chosen to match literal reading  # UNSPECIFIED IN MANUSCRIPT
+  random_seed_split: null  # must be set for exact reproducibility  # UNSPECIFIED IN MANUSCRIPT
+
+  downsampling:
+    apply_to: "training_only"
+    ratio_healthy_to_bankrupt: "1:1"
+    random_seed_downsampling: null  # must be set for exact reproducibility  # UNSPECIFIED IN MANUSCRIPT
+
+  # Counts reported in the manuscript (used as audit targets, not hard constraints)
+  reported_counts:
+    total_n: 31131
+    bankrupt_n: 97
+    training_set:
+      n_total: 21791
+      n_bankrupt: 69
+    validation_set:
+      n_total: 9340
+      n_bankrupt: 28
+      n_healthy: 9312
+    downsampled_training:
+      n_bankrupt: 69
+      n_healthy: 69
+      n_total: 138
+
+# -------------------------------------------------------------------------------------------------------------------------------
+# ALGORITHMS / NETWORK ARCHITECTURES: Method × representation (6 executed architectures)
+# -------------------------------------------------------------------------------------------------------------------------------
+algorithms:
+  logistic_regression:
+    software: "R glm"  # manuscript
+    family: "binomial"
+    link: "logit"
+    significance_threshold_alpha: 0.05
+    classification_threshold: 0.50  # required to compute confusion metrics  # UNSPECIFIED IN MANUSCRIPT
+    standard_representation:
+      inputs: "standard_ratios (10)"
+    compositional_representation:
+      inputs: "coda_plr_non_redundant (6)"
+
+  k_nearest_neighbours:
+    software: "R class::knn"  # manuscript
+    distance_metric: "Euclidean"
+    feature_scaling: "none"  # must be declared; manuscript silent  # UNSPECIFIED IN MANUSCRIPT
+    k_tuning_protocol:
+      tune: true
+      objective: "max_accuracy"
+      k_grid: null  # must be declared (e.g., [1..Kmax])  # UNSPECIFIED IN MANUSCRIPT
+      selection_level: "validation_or_internal_cv"  # manuscript does not specify  # UNSPECIFIED IN MANUSCRIPT
+    k_selected: 5  # reported best
+    standard_representation:
+      inputs: "standard_ratios (10)"
+    compositional_representation:
+      inputs: "coda_plr_exhaustive (21)"
+
+  random_forest:
+    software: "R randomForest"  # manuscript
+    num_trees_B: 100
+    importance_measure: "Mean Decrease in Gini Impurity"
+
+    bootstrap: true  # R randomForest default; manuscript does not restate  # UNSPECIFIED IN MANUSCRIPT
+    random_seed_rf: null  # must be set for exact reproducibility  # UNSPECIFIED IN MANUSCRIPT
+
+    standard_representation:
+      inputs: "standard_ratios (10)"
+      mtry: 4  # reported
+    compositional_representation:
+      inputs: "coda_plr_exhaustive (21)"
+      mtry: 7  # reported
+
+# -------------------------------------------------------------------------------------------------------------------------------
+# EVALUATION: Confusion-matrix metrics computed on the validation set
+# -------------------------------------------------------------------------------------------------------------------------------
+evaluation:
+  evaluation_set: "validation_only"
+  metrics:
+    accuracy: "(TP+TN)/(TP+TN+FP+FN)"
+    sensitivity: "TP/(TP+FN)"
+    specificity: "TN/(TN+FP)"
+    balanced_accuracy: "(sensitivity+specificity)/2"
+  metric_priority: "sensitivity"  # emphasized in manuscript
+
+# -------------------------------------------------------------------------------------------------------------------------------
+# STATISTICAL DIAGNOSTICS: Skewness / kurtosis (Table 1) + counterfactual pruning impact
+# -------------------------------------------------------------------------------------------------------------------------------
+statistical_diagnostics:
+  compute_on: "full_sample_pre_split"
+  variables:
+    - "standard_ratios (10)"
+    - "coda_plr_exhaustive (21)"
+  skewness_definition: null  # must be fixed (estimator + bias correction)  # UNSPECIFIED IN MANUSCRIPT
+  kurtosis_definition: null  # must be fixed (raw vs excess; estimator)  # UNSPECIFIED IN MANUSCRIPT
+
+  counterfactual_outlier_pruning:
+    rule: "Tukey_fences"
+    IQR_definition: "Q3 - Q1"
+    lower_fence: "Q1 - 1.5*IQR"
+    upper_fence: "Q3 + 1.5*IQR"
+    use: "quantify representativeness loss; NOT applied in modeling"
+
+# -------------------------------------------------------------------------------------------------------------------------------
+# METHODOLOGICAL NOTES: Explicitly freeze conventions that commonly drift across implementations
+# -------------------------------------------------------------------------------------------------------------------------------
+methodological_notes:
+  no_llm_used: true  # paper contains no LLM component  # N/A
+  coordinate_choice_note: "For non-parametric models, using only D-1 plr makes results arbitrary; use exhaustive 21 plr as per manuscript."
+  distance_consistency_note: "Manuscript states Euclidean on all 21 plr is Aitchison-consistent."
+  replicability_note: "plr exhaustive set is uniquely defined; ilr choices are not."
